@@ -26,15 +26,12 @@ import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
 import static okio.Util.checkOffsetAndCount;
 
 /** Essential APIs for working with Okio. */
 public final class Okio {
-  private static final Logger logger = Logger.getLogger(Okio.class.getName());
 
   private Okio() {
   }
@@ -113,9 +110,9 @@ public final class Okio {
    */
   public static Sink sink(final Socket socket) throws IOException {
     if (socket == null) throw new IllegalArgumentException("socket == null");
-    AsyncTimeout timeout = timeout(socket);
+    AsyncTimeout timeout = AsyncTimeout.closing(socket);
     Sink sink = sink(socket.getOutputStream(), timeout);
-    return timeout.sink(sink);
+    return AsyncTimeout.sink(sink, timeout);
   }
 
   /** Returns a source that reads from {@code in}. */
@@ -193,20 +190,8 @@ public final class Okio {
    */
   public static Source source(final Socket socket) throws IOException {
     if (socket == null) throw new IllegalArgumentException("socket == null");
-    AsyncTimeout timeout = timeout(socket);
+    AsyncTimeout timeout = AsyncTimeout.closing(socket);
     Source source = source(socket.getInputStream(), timeout);
-    return timeout.source(source);
-  }
-
-  private static AsyncTimeout timeout(final Socket socket) {
-    return new AsyncTimeout() {
-      @Override protected void timedOut() {
-        try {
-          socket.close();
-        } catch (Exception e) {
-          logger.log(Level.WARNING, "Failed to close timed out socket " + socket, e);
-        }
-      }
-    };
+    return AsyncTimeout.source(source, timeout);
   }
 }

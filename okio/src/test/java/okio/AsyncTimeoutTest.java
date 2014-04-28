@@ -35,10 +35,10 @@ import static org.junit.Assert.fail;
  */
 public class AsyncTimeoutTest {
   private final List<Timeout> timedOut = new CopyOnWriteArrayList<Timeout>();
-  private final AsyncTimeout a = new RecordingAsyncTimeout();
-  private final AsyncTimeout b = new RecordingAsyncTimeout();
-  private final AsyncTimeout c = new RecordingAsyncTimeout();
-  private final AsyncTimeout d = new RecordingAsyncTimeout();
+  private final AsyncTimeout a = recordingTimeout();
+  private final AsyncTimeout b = recordingTimeout();
+  private final AsyncTimeout c = recordingTimeout();
+  private final AsyncTimeout d = recordingTimeout();
 
   @Before public void setUp() throws Exception {
     a.timeout( 250, TimeUnit.MILLISECONDS);
@@ -48,7 +48,7 @@ public class AsyncTimeoutTest {
   }
 
   @Test public void zeroTimeoutIsNoTimeout() throws Exception {
-    AsyncTimeout timeout = new RecordingAsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.timeout(0, TimeUnit.MILLISECONDS);
     timeout.enter();
     Thread.sleep(250);
@@ -132,7 +132,7 @@ public class AsyncTimeoutTest {
   }
 
   @Test public void deadlineOnly() throws Exception {
-    RecordingAsyncTimeout timeout = new RecordingAsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.deadline(250, TimeUnit.MILLISECONDS);
     timeout.enter();
     Thread.sleep(500);
@@ -141,7 +141,7 @@ public class AsyncTimeoutTest {
   }
 
   @Test public void deadlineBeforeTimeout() throws Exception {
-    RecordingAsyncTimeout timeout = new RecordingAsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.deadline(250, TimeUnit.MILLISECONDS);
     timeout.timeout(750, TimeUnit.MILLISECONDS);
     timeout.enter();
@@ -151,7 +151,7 @@ public class AsyncTimeoutTest {
   }
 
   @Test public void deadlineAfterTimeout() throws Exception {
-    RecordingAsyncTimeout timeout = new RecordingAsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.timeout(250, TimeUnit.MILLISECONDS);
     timeout.deadline(750, TimeUnit.MILLISECONDS);
     timeout.enter();
@@ -161,7 +161,7 @@ public class AsyncTimeoutTest {
   }
 
   @Test public void deadlineStartsBeforeEnter() throws Exception {
-    RecordingAsyncTimeout timeout = new RecordingAsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.deadline(500, TimeUnit.MILLISECONDS);
     Thread.sleep(500);
     timeout.enter();
@@ -171,7 +171,7 @@ public class AsyncTimeoutTest {
   }
 
   @Test public void deadlineInThePast() throws Exception {
-    RecordingAsyncTimeout timeout = new RecordingAsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.deadlineNanoTime(System.nanoTime() - 1);
     timeout.enter();
     Thread.sleep(250);
@@ -189,14 +189,15 @@ public class AsyncTimeoutTest {
         }
       }
     };
-    AsyncTimeout timeout = new AsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.timeout(250, TimeUnit.MILLISECONDS);
-    Sink timeoutSink = timeout.sink(sink);
+    Sink timeoutSink = AsyncTimeout.sink(sink, timeout);
     try {
       timeoutSink.write(null, 0);
       fail();
     } catch (InterruptedIOException expected) {
     }
+    assertTimedOut(timeout);
   }
 
   @Test public void wrappedSourceTimesOut() throws Exception {
@@ -210,14 +211,15 @@ public class AsyncTimeoutTest {
         }
       }
     };
-    AsyncTimeout timeout = new AsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.timeout(250, TimeUnit.MILLISECONDS);
-    Source timeoutSource = timeout.source(source);
+    Source timeoutSource = AsyncTimeout.source(source, timeout);
     try {
       timeoutSource.read(null, 0);
       fail();
     } catch (InterruptedIOException expected) {
     }
+    assertTimedOut(timeout);
   }
 
   @Test public void wrappedThrowsWithTimeout() throws Exception {
@@ -231,9 +233,9 @@ public class AsyncTimeoutTest {
         }
       }
     };
-    AsyncTimeout timeout = new AsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.timeout(250, TimeUnit.MILLISECONDS);
-    Sink timeoutSink = timeout.sink(sink);
+    Sink timeoutSink = AsyncTimeout.sink(sink, timeout);
     try {
       timeoutSink.write(null, 0);
       fail();
@@ -241,6 +243,7 @@ public class AsyncTimeoutTest {
       assertEquals("timeout", expected.getMessage());
       assertEquals("exception and timeout", expected.getCause().getMessage());
     }
+    assertTimedOut(timeout);
   }
 
   @Test public void wrappedThrowsWithoutTimeout() throws Exception {
@@ -249,9 +252,9 @@ public class AsyncTimeoutTest {
         throw new IOException("no timeout occurred");
       }
     };
-    AsyncTimeout timeout = new AsyncTimeout();
+    AsyncTimeout timeout = recordingTimeout();
     timeout.timeout(250, TimeUnit.MILLISECONDS);
-    Sink timeoutSink = timeout.sink(sink);
+    Sink timeoutSink = AsyncTimeout.sink(sink, timeout);
     try {
       timeoutSink.write(null, 0);
       fail();
@@ -265,9 +268,18 @@ public class AsyncTimeoutTest {
     assertEquals(Arrays.asList(expected), timedOut);
   }
 
-  class RecordingAsyncTimeout extends AsyncTimeout {
-    @Override protected void timedOut() {
-      timedOut.add(this);
+  private AsyncTimeout recordingTimeout() {
+    RecordTimeout recordTimeout = new RecordTimeout();
+    AsyncTimeout timeout = AsyncTimeout.create(recordTimeout);
+    recordTimeout.timeout = timeout;
+    return timeout;
+  }
+
+  class RecordTimeout implements Runnable {
+    private volatile AsyncTimeout timeout;
+
+    @Override public void run() {
+      timedOut.add(timeout);
     }
   }
 }

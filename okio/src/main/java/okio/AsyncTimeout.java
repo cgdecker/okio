@@ -15,29 +15,167 @@
  */
 package okio;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.net.Socket;
+import java.nio.channels.InterruptibleChannel;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
- * This timeout uses a background thread to take action exactly when the timeout
+ * A timeout that uses a background thread to take action exactly when the timeout
  * occurs. Use this to implement timeouts where they aren't supported natively,
  * such as to sockets that are blocked on writing.
  *
- * <p>Subclasses should override {@link #timedOut} to take action when a timeout
- * occurs. This method will be invoked by the shared watchdog thread so it
- * should not do any long-running operations. Otherwise we risk starving other
- * timeouts from being triggered.
+ * <p>Async timeouts are created by providing a {@link Runnable} that will run
+ * on the background thread when the timeout occurs. This runnable should
+ * interrupt the blocking operation. As the background thread is shared, the
+ * runnable should not do any long-running operations. Otherwise we risk starving
+ * other timeouts from being triggered.
  *
- * <p>Use {@link #sink} and {@link #source} to apply this timeout to a stream.
- * The returned value will apply the timeout to each operation on the wrapped
- * stream.
+ * <p>Use {@link #sink} and {@link #source} to apply a timeout to a stream. The
+ * returned value will apply the timeout to each operation on the wrapped stream.
  *
  * <p>Callers should call {@link #enter} before doing work that is subject to
  * timeouts, and {@link #exit} afterwards. The return value of {@link #exit}
- * indicates whether a timeout was triggered. Note that the call to {@link
- * #timedOut} is asynchronous, and may be called after {@link #exit}.
+ * indicates whether a timeout was triggered. Note that the call to the
+ * interrupting runnable is asynchronous, and may happen after {@link #exit}.
  */
-public class AsyncTimeout extends Timeout {
+public final class AsyncTimeout extends Timeout {
+  private static final Logger logger =
+      Logger.getLogger(AsyncTimeout.class.getName());
+
+  /**
+   * Returns a new timeout that runs the given {@code interrupt} on a background
+   * thread to interrupt any blocking task when the timeout occurs.
+   */
+  public static AsyncTimeout create(Runnable interrupt) {
+    return new AsyncTimeout(interrupt);
+  }
+
+  /**
+   * Returns a new timeout that closes the given {@code closeable} on a background
+   * thread when the timeout occurs. This only has the effect of interrupting the
+   * current blocking operation for specific types of closeables that support it,
+   * such as {@link Socket} and {@link InterruptibleChannel}.
+   */
+  public static AsyncTimeout closing(final Closeable closeable) {
+    return create(new Runnable() {
+      @Override
+      public void run() {
+        try {
+          closeable.close();
+        } catch (Exception e) {
+          logger.log(Level.WARNING,
+              "Failed to close timed out resource " + closeable, e);
+        }
+      }
+    });
+  }
+
+
+  /**
+   * Returns a new source that delegates to {@code source}, using the given
+   * {@code timeout} to implement timeouts.
+   */
+  public static Source source(final Source source, final AsyncTimeout timeout) {
+    return new Source() {
+      @Override public long read(Buffer sink, long byteCount) throws IOException {
+        boolean throwOnTimeout = false;
+        timeout.enter();
+        try {
+          long result = source.read(sink, byteCount);
+          throwOnTimeout = true;
+          return result;
+        } catch (IOException e) {
+          throw timeout.exit(e);
+        } finally {
+          timeout.exit(throwOnTimeout);
+        }
+      }
+
+      @Override public void close() throws IOException {
+        boolean throwOnTimeout = false;
+        try {
+          source.close();
+          throwOnTimeout = true;
+        } catch (IOException e) {
+          throw timeout.exit(e);
+        } finally {
+          timeout.exit(throwOnTimeout);
+        }
+      }
+
+      @Override public Timeout timeout() {
+        return timeout;
+      }
+
+      @Override public String toString() {
+        return "AsyncTimeout.source(" + source + ")";
+      }
+    };
+  }
+
+  /**
+   * Returns a new sink that delegates to {@code sink}, using the given
+   * {@code timeout} to implement timeouts.
+   */
+  public static Sink sink(final Sink sink, final AsyncTimeout timeout) {
+    return new Sink() {
+      @Override public void write(Buffer source, long byteCount) throws IOException {
+        boolean throwOnTimeout = false;
+        timeout.enter();
+        try {
+          sink.write(source, byteCount);
+          throwOnTimeout = true;
+        } catch (IOException e) {
+          throw timeout.exit(e);
+        } finally {
+          timeout.exit(throwOnTimeout);
+        }
+      }
+
+      @Override public void flush() throws IOException {
+        boolean throwOnTimeout = false;
+        timeout.enter();
+        try {
+          sink.flush();
+          throwOnTimeout = true;
+        } catch (IOException e) {
+          throw timeout.exit(e);
+        } finally {
+          timeout.exit(throwOnTimeout);
+        }
+      }
+
+      @Override public void close() throws IOException {
+        boolean throwOnTimeout = false;
+        timeout.enter();
+        try {
+          sink.close();
+          throwOnTimeout = true;
+        } catch (IOException e) {
+          throw timeout.exit(e);
+        } finally {
+          timeout.exit(throwOnTimeout);
+        }
+      }
+
+      @Override public Timeout timeout() {
+        return timeout;
+      }
+
+      @Override public String toString() {
+        return "AsyncTimeout.sink(" + sink + ")";
+      }
+    };
+  }
+
+  private static final Runnable DO_NOTHING = new Runnable() {
+    @Override public void run() {}
+  };
+
   /**
    * The watchdog thread processes a linked list of pending timeouts, sorted in
    * the order to be triggered. This class synchronizes on AsyncTimeout.class.
@@ -57,6 +195,19 @@ public class AsyncTimeout extends Timeout {
 
   /** If scheduled, this is the time that the watchdog should time this out. */
   private long timeoutAt;
+
+  /** Runnable to run when timeout occurs. */
+  private final Runnable onTimeout;
+
+  /** Only used for the head of the timeout queue. */
+  private AsyncTimeout() {
+    this(DO_NOTHING);
+  }
+
+  private AsyncTimeout(Runnable onTimeout) {
+    if (onTimeout == null) throw new IllegalArgumentException("onTimeout == null");
+    this.onTimeout = onTimeout;
+  }
 
   public final void enter() {
     if (inQueue) throw new IllegalStateException("Unbalanced enter/exit");
@@ -135,112 +286,6 @@ public class AsyncTimeout extends Timeout {
   }
 
   /**
-   * Invoked by the watchdog thread when the time between calls to {@link
-   * #enter()} and {@link #exit()} has exceeded the timeout.
-   */
-  protected void timedOut() {
-  }
-
-  /**
-   * Returns a new sink that delegates to {@code sink}, using this to implement
-   * timeouts. This works best if {@link #timedOut} is overridden to interrupt
-   * {@code sink}'s current operation.
-   */
-  public final Sink sink(final Sink sink) {
-    return new Sink() {
-      @Override public void write(Buffer source, long byteCount) throws IOException {
-        boolean throwOnTimeout = false;
-        enter();
-        try {
-          sink.write(source, byteCount);
-          throwOnTimeout = true;
-        } catch (IOException e) {
-          throw exit(e);
-        } finally {
-          exit(throwOnTimeout);
-        }
-      }
-
-      @Override public void flush() throws IOException {
-        boolean throwOnTimeout = false;
-        enter();
-        try {
-          sink.flush();
-          throwOnTimeout = true;
-        } catch (IOException e) {
-          throw exit(e);
-        } finally {
-          exit(throwOnTimeout);
-        }
-      }
-
-      @Override public void close() throws IOException {
-        boolean throwOnTimeout = false;
-        enter();
-        try {
-          sink.close();
-          throwOnTimeout = true;
-        } catch (IOException e) {
-          throw exit(e);
-        } finally {
-          exit(throwOnTimeout);
-        }
-      }
-
-      @Override public Timeout timeout() {
-        return AsyncTimeout.this;
-      }
-
-      @Override public String toString() {
-        return "AsyncTimeout.sink(" + sink + ")";
-      }
-    };
-  }
-
-  /**
-   * Returns a new source that delegates to {@code source}, using this to
-   * implement timeouts. This works best if {@link #timedOut} is overridden to
-   * interrupt {@code sink}'s current operation.
-   */
-  public final Source source(final Source source) {
-    return new Source() {
-      @Override public long read(Buffer sink, long byteCount) throws IOException {
-        boolean throwOnTimeout = false;
-        enter();
-        try {
-          long result = source.read(sink, byteCount);
-          throwOnTimeout = true;
-          return result;
-        } catch (IOException e) {
-          throw exit(e);
-        } finally {
-          exit(throwOnTimeout);
-        }
-      }
-
-      @Override public void close() throws IOException {
-        boolean throwOnTimeout = false;
-        try {
-          source.close();
-          throwOnTimeout = true;
-        } catch (IOException e) {
-          throw exit(e);
-        } finally {
-          exit(throwOnTimeout);
-        }
-      }
-
-      @Override public Timeout timeout() {
-        return AsyncTimeout.this;
-      }
-
-      @Override public String toString() {
-        return "AsyncTimeout.source(" + source + ")";
-      }
-    };
-  }
-
-  /**
    * Throws an InterruptedIOException if {@code throwOnTimeout} is true and a
    * timeout occurred.
    */
@@ -275,7 +320,7 @@ public class AsyncTimeout extends Timeout {
           if (timedOut == null) continue;
 
           // Close the timed out node.
-          timedOut.timedOut();
+          timedOut.onTimeout.run();
         } catch (InterruptedException ignored) {
         }
       }
